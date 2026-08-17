@@ -10,9 +10,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(L3_H2D_BUILD_TESTS "Build H2D gtests" ON)
 
+find_package(Threads REQUIRED)
+
 add_executable(h2d_bench h2d_bench.cpp)
 target_include_directories(h2d_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(h2d_bench PRIVATE ${CMAKE_DL_LIBS})
+target_link_libraries(h2d_bench PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
 
 if(L3_H2D_BUILD_TESTS)
     find_package(GTest QUIET)
@@ -35,6 +37,6 @@ if(L3_H2D_BUILD_TESTS)
     enable_testing()
     add_executable(test_h2d test_h2d.cpp)
     target_include_directories(test_h2d PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(test_h2d PRIVATE ${L3_GTEST_MAIN} ${CMAKE_DL_LIBS})
+    target_link_libraries(test_h2d PRIVATE ${L3_GTEST_MAIN} ${CMAKE_DL_LIBS} Threads::Threads)
     add_test(NAME test_h2d COMMAND test_h2d)
 endif()

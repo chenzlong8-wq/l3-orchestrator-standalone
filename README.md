@@ -4,8 +4,8 @@ Two independent projects. Download the zip you need.
 
 | Zip | What |
 | --- | --- |
-| [l3-orchestrator-standalone.zip](https://github.com/chenzlong8-wq/l3-orchestrator-standalone/releases/download/v0.3.0/l3-orchestrator-standalone.zip) | L3 lib + original-repo mocks + `orch_main` |
-| [l3-h2d-standalone.zip](https://github.com/chenzlong8-wq/l3-orchestrator-standalone/releases/download/v0.3.0/l3-h2d-standalone.zip) | `h2d_bench` + `test_h2d` only |
+| [l3-orchestrator-standalone.zip](https://github.com/chenzlong8-wq/l3-orchestrator-standalone/releases/download/v0.4.0/l3-orchestrator-standalone.zip) | L3 lib + original-repo mocks + `orch_main` |
+| [l3-h2d-standalone.zip](https://github.com/chenzlong8-wq/l3-orchestrator-standalone/releases/download/v0.4.0/l3-h2d-standalone.zip) | `h2d_bench` + `test_h2d` only |
 
 Or clone and build each directory by itself:
 

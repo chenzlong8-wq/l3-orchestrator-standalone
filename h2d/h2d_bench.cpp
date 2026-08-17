@@ -51,7 +51,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    h2d::AclApi acl = h2d::load_acl();
+    h2d::AclApi acl = h2d::load_acl(device);
     bool have_acl = acl.ready;
     std::cout << "h2d_bench: host memcpy always";
     if (have_acl) std::cout << "; ACL H2D/D2H on device " << device << "\n";
@@ -83,7 +83,7 @@ int main(int argc, char **argv) {
 
             if (have_acl) {
                 std::fill(back.begin(), back.end(), 0);
-                auto dev = h2d::acl_roundtrip(acl, device, src.data(), back.data(), n);
+                auto dev = h2d::acl_roundtrip(acl, src.data(), back.data(), n);
                 if (!dev.error.empty()) {
                     std::cerr << "h2d_bench: ACL copy failed at " << n << " bytes: " << dev.error << "\n";
                     ++failures;

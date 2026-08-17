@@ -16,12 +16,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
 // Host memcpy always. Real H2D/D2H via dlopen(libascendcl.so) when CANN is present.
-// Never link CANN — local Ubuntu / WSL must build and run without it.
+// Never link CANN — Ubuntu / WSL without NPU must still build and run.
 
 namespace h2d {
 
@@ -33,7 +32,7 @@ inline double gbps(size_t bytes, int64_t ns) {
 }
 
 inline void fill_pattern(uint8_t *p, size_t n, uint8_t seed) {
-    for (size_t i = 0; i < n; ++i) p[i] = static_cast<uint8_t>(seed + i);
+    for (size_t i = 0; i < n; ++i) p[i] = static_cast<uint8_t>(seed + static_cast<uint8_t>(i));
 }
 
 inline bool buffers_equal(const uint8_t *a, const uint8_t *b, size_t n) { return std::memcmp(a, b, n) == 0; }
@@ -45,16 +44,17 @@ struct TimedCopy {
 
 inline TimedCopy host_memcpy(const uint8_t *src, uint8_t *dst, size_t n) {
     const auto t0 = std::chrono::steady_clock::now();
-    std::memcpy(dst, src, n);
+    if (n > 0) std::memcpy(dst, src, n);
     const auto t1 = std::chrono::steady_clock::now();
     TimedCopy r;
     r.ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-    r.ok = buffers_equal(src, dst, n);
+    r.ok = n == 0 || buffers_equal(src, dst, n);
     return r;
 }
 
-// Minimal ACL surface. Values match CANN aclrt headers.
 enum {
+    kAclSuccess = 0,
+    kAclErrorRepeatInitialize = 100002,
     kAclMemMallocHugeFirst = 0,
     kAclMemcpyHostToDevice = 1,
     kAclMemcpyDeviceToHost = 2,
@@ -63,57 +63,110 @@ enum {
 struct AclApi {
     void *handle{nullptr};
     int (*init)(const char *){nullptr};
+    int (*finalize)(){nullptr};
     int (*set_device)(int32_t){nullptr};
-    int (*malloc)(void **, size_t, int){nullptr};
-    int (*free)(void *){nullptr};
+    int (*get_device)(int32_t *){nullptr};
+    int (*reset_device)(int32_t){nullptr};
+    int (*create_context)(void **, int32_t){nullptr};
+    int (*destroy_context)(void *){nullptr};
+    int (*set_current_context)(void *){nullptr};
+    int (*malloc_dev)(void **, size_t, int){nullptr};
+    int (*free_dev)(void *){nullptr};
     int (*memcpy)(void *, size_t, const void *, size_t, int){nullptr};
     int (*sync)(){nullptr};
-    int (*finalize)(){nullptr};
-    std::string error;
+    const char *(*recent_err)(){nullptr};
+    void *context{nullptr};
+    int32_t device{-1};
+    bool inited{false};
     bool ready{false};
+    std::string error;
 };
+
+inline std::string acl_msg(const AclApi &api, const char *what, int rc) {
+    std::string s = std::string(what) + " failed rc=" + std::to_string(rc);
+    if (api.recent_err != nullptr) {
+        const char *e = api.recent_err();
+        if (e != nullptr && e[0] != '\0') s += std::string(" ") + e;
+    }
+    return s;
+}
 
 inline void *try_dlopen() {
     const char *home = std::getenv("ASCEND_HOME_PATH");
     if (home != nullptr && home[0] != '\0') {
-        const std::string p = std::string(home) + "/lib64/libascendcl.so";
-        if (void *h = dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL)) return h;
+        const char *suffixes[] = {"/lib64/libascendcl.so", "/lib64/libascendcl.so.1", "/lib/libascendcl.so"};
+        for (const char *suf : suffixes) {
+            const std::string p = std::string(home) + suf;
+            if (void *h = dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL)) return h;
+        }
     }
     if (void *h = dlopen("libascendcl.so", RTLD_NOW | RTLD_LOCAL)) return h;
+    if (void *h = dlopen("libascendcl.so.1", RTLD_NOW | RTLD_LOCAL)) return h;
     return nullptr;
 }
 
-inline AclApi load_acl() {
+inline AclApi load_acl(int32_t device) {
     AclApi api;
     api.handle = try_dlopen();
     if (api.handle == nullptr) {
         api.error = "libascendcl.so not found (no CANN). Host memcpy only.";
         return api;
     }
-    auto load = [&](const char *name) -> void * {
+    auto load = [&](const char *name, bool required) -> void * {
         void *s = dlsym(api.handle, name);
-        if (s == nullptr) api.error = std::string("dlsym failed: ") + name;
+        if (s == nullptr && required) api.error = std::string("dlsym failed: ") + name;
         return s;
     };
-    api.init = reinterpret_cast<int (*)(const char *)>(load("aclInit"));
-    api.set_device = reinterpret_cast<int (*)(int32_t)>(load("aclrtSetDevice"));
-    api.malloc = reinterpret_cast<int (*)(void **, size_t, int)>(load("aclrtMalloc"));
-    api.free = reinterpret_cast<int (*)(void *)>(load("aclrtFree"));
-    api.memcpy = reinterpret_cast<int (*)(void *, size_t, const void *, size_t, int)>(load("aclrtMemcpy"));
-    api.sync = reinterpret_cast<int (*)()>(load("aclrtSynchronizeDevice"));
-    api.finalize = reinterpret_cast<int (*)()>(load("aclFinalize"));
+    api.init = reinterpret_cast<int (*)(const char *)>(load("aclInit", true));
+    api.finalize = reinterpret_cast<int (*)()>(load("aclFinalize", false));
+    api.set_device = reinterpret_cast<int (*)(int32_t)>(load("aclrtSetDevice", true));
+    api.get_device = reinterpret_cast<int (*)(int32_t *)>(load("aclrtGetDevice", false));
+    api.reset_device = reinterpret_cast<int (*)(int32_t)>(load("aclrtResetDevice", false));
+    api.create_context = reinterpret_cast<int (*)(void **, int32_t)>(load("aclrtCreateContext", true));
+    api.destroy_context = reinterpret_cast<int (*)(void *)>(load("aclrtDestroyContext", false));
+    api.set_current_context = reinterpret_cast<int (*)(void *)>(load("aclrtSetCurrentContext", false));
+    api.malloc_dev = reinterpret_cast<int (*)(void **, size_t, int)>(load("aclrtMalloc", true));
+    api.free_dev = reinterpret_cast<int (*)(void *)>(load("aclrtFree", true));
+    api.memcpy = reinterpret_cast<int (*)(void *, size_t, const void *, size_t, int)>(load("aclrtMemcpy", true));
+    api.sync = reinterpret_cast<int (*)()>(load("aclrtSynchronizeDevice", false));
+    api.recent_err = reinterpret_cast<const char *(*)()>(load("aclGetRecentErrMsg", false));
     if (!api.error.empty()) return api;
-    if (api.init(nullptr) != 0) {
-        api.error = "aclInit failed";
+
+    int rc = api.init(nullptr);
+    if (rc != kAclSuccess && rc != kAclErrorRepeatInitialize) {
+        api.error = acl_msg(api, "aclInit", rc);
         return api;
+    }
+    api.inited = rc == kAclSuccess;
+
+    rc = api.set_device(device);
+    if (rc != kAclSuccess) {
+        api.error = acl_msg(api, "aclrtSetDevice", rc);
+        return api;
+    }
+    api.device = device;
+
+    rc = api.create_context(&api.context, device);
+    if (rc != kAclSuccess) {
+        api.error = acl_msg(api, "aclrtCreateContext", rc);
+        return api;
+    }
+    if (api.set_current_context != nullptr) {
+        rc = api.set_current_context(api.context);
+        if (rc != kAclSuccess) {
+            api.error = acl_msg(api, "aclrtSetCurrentContext", rc);
+            return api;
+        }
     }
     api.ready = true;
     return api;
 }
 
 inline void close_acl(AclApi &api) {
-    if (api.ready && api.finalize) api.finalize();
-    if (api.handle) dlclose(api.handle);
+    if (api.context != nullptr && api.destroy_context != nullptr) api.destroy_context(api.context);
+    if (api.device >= 0 && api.reset_device != nullptr) api.reset_device(api.device);
+    if (api.inited && api.finalize != nullptr) api.finalize();
+    if (api.handle != nullptr) dlclose(api.handle);
     api = {};
 }
 
@@ -123,41 +176,38 @@ struct DeviceCopy {
     std::string error;
 };
 
-inline DeviceCopy acl_roundtrip(AclApi &api, int32_t device, const uint8_t *src, uint8_t *back, size_t n) {
+inline DeviceCopy acl_roundtrip(AclApi &api, const uint8_t *src, uint8_t *back, size_t n) {
     DeviceCopy out;
     if (!api.ready) {
         out.error = api.error.empty() ? "ACL not ready" : api.error;
         return out;
     }
-    if (api.set_device(device) != 0) {
-        out.error = "aclrtSetDevice failed";
-        return out;
-    }
     void *dev = nullptr;
-    if (api.malloc(&dev, n, kAclMemMallocHugeFirst) != 0) {
-        out.error = "aclrtMalloc failed";
+    int rc = api.malloc_dev(&dev, n == 0 ? 1 : n, kAclMemMallocHugeFirst);
+    if (rc != kAclSuccess) {
+        out.error = acl_msg(api, "aclrtMalloc", rc);
         return out;
     }
     {
         const auto t0 = std::chrono::steady_clock::now();
-        const int rc = api.memcpy(dev, n, src, n, kAclMemcpyHostToDevice);
+        rc = api.memcpy(dev, n, src, n, kAclMemcpyHostToDevice);
         if (api.sync) api.sync();
         const auto t1 = std::chrono::steady_clock::now();
         out.h2d.ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-        out.h2d.ok = rc == 0;
-        if (rc != 0) out.error = "aclrtMemcpy H2D failed";
+        out.h2d.ok = rc == kAclSuccess;
+        if (rc != kAclSuccess) out.error = acl_msg(api, "aclrtMemcpy H2D", rc);
     }
     if (out.error.empty()) {
         const auto t0 = std::chrono::steady_clock::now();
-        const int rc = api.memcpy(back, n, dev, n, kAclMemcpyDeviceToHost);
+        rc = api.memcpy(back, n, dev, n, kAclMemcpyDeviceToHost);
         if (api.sync) api.sync();
         const auto t1 = std::chrono::steady_clock::now();
         out.d2h.ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-        out.d2h.ok = rc == 0 && buffers_equal(src, back, n);
-        if (rc != 0) out.error = "aclrtMemcpy D2H failed";
+        out.d2h.ok = rc == kAclSuccess && (n == 0 || buffers_equal(src, back, n));
+        if (rc != kAclSuccess) out.error = acl_msg(api, "aclrtMemcpy D2H", rc);
         else if (!out.d2h.ok) out.error = "D2H payload mismatch";
     }
-    api.free(dev);
+    api.free_dev(dev);
     return out;
 }
 
